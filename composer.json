@@ -90,70 +90,70 @@
             "type": "path",
             "url": "~/Documents/repos-easyengine/site-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/site-type-php",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/site-type-wp",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/config-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/admin-tools-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/auth-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/cron-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/mailhog-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/service-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         },
         {
             "type": "path",
             "url": "~/Documents/repos-easyengine/shell-command",
             "options": {
-                "symlink": true
+                "symlink": false
             }
         }
 
