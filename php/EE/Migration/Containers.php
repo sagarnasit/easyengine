@@ -3,7 +3,6 @@
 namespace EE\Migration;
 
 use EE\RevertableStepProcessor;
-use function EE\Utils\default_launch;
 use EE;
 
 /**
@@ -23,9 +22,9 @@ class Containers {
 		EE\Utils\delem_log( 'Starting container migration' );
 
 		self::$rsp = new RevertableStepProcessor();
-		self::pull_new_images();
-		self::migrate_site_containers();
-		self::migrate_global_containers();
+		self::migrate_all_docker_images();
+		// @todo: add doc blocks.
+		// @todo: update database after image migration.
 		if ( ! self::$rsp->execute() ) {
 			throw new \Exception( 'Unable to migrate sites to newer version' );
 		}
@@ -34,20 +33,54 @@ class Containers {
 	}
 
 	/**
-	 * Pulls new images of all containers used by easyengine
+	 * Migrate all docker images with new version.
 	 */
-	private static function pull_new_images() {
+	private static function migrate_all_docker_images() {
 
-		$img_versions = EE\Utils\get_image_versions();		
-		self::pull_or_error( 'easyengine/php', $img_versions['easyengine/php'] );
-		self::pull_or_error( 'easyengine/cron', $img_versions['easyengine/cron'] );
-		self::pull_or_error( 'easyengine/redis', $img_versions['easyengine/redis'] );
-		self::pull_or_error( 'easyengine/nginx', $img_versions['easyengine/nginx'] );
-		self::pull_or_error( 'easyengine/postfix', $img_versions['easyengine/postfix'] );
-		self::pull_or_error( 'easyengine/mailhog', $img_versions['easyengine/mailhog'] );
-		self::pull_or_error( 'easyengine/mariadb', $img_versions['easyengine/mariadb'] );
-		self::pull_or_error( 'easyengine/phpmyadmin', $img_versions['easyengine/phpmyadmin'] );
-		self::pull_or_error( 'easyengine/nginx-proxy', $img_versions['easyengine/nginx-proxy'] );
+		$img_versions     = EE\Utils\get_image_versions();
+		$current_versions = self::get_current_docker_images_versions();
+
+		$changed_images = [];
+		foreach ( $img_versions as $img => $version ) {
+			if ( $current_versions[ $img ] !== $version ) {
+				$changed_images[] = $img;
+//				self::pull_or_error( $img, $version );
+			}
+		}
+
+		if( empty( $changed_images) ) {
+			return;
+		}
+
+		self::migrate_global_containers( $changed_images );
+		self::migrate_site_containers( $changed_images );
+		self::save_upgraded_image_versions($current_versions, $img_versions, $changed_images);
+
+	}
+
+	private static function save_upgraded_image_versions( $current_versions, $new_versions, $changed_images) {
+
+		self::$rsp->add_step(
+			'save-image-verions-in-database',
+			'EE\Migration\Containers::create_database_entry',
+			'EE\Migration\Containers::revert_database_entry',
+			[$new_versions, $changed_images],
+			[$current_versions, $changed_images]
+
+		);
+
+	}
+
+	public static function create_database_entry($new_versions, $changed_images) {
+		foreach($changed_images as $image) {
+			EE\Model\Option::update( [ [ 'key', $image ] ], [ 'value' => $new_versions[ $image ] ] );
+		}
+	}
+
+	public static function revert_database_entry($old_version, $changed_images) {
+		foreach($changed_images as $image) {
+			EE\Model\Option::update( [ [ 'key', $image ] ], [ 'value' => $old_version[ $image ] ] );
+		}
 	}
 
 	/**
@@ -59,74 +92,225 @@ class Containers {
 	 * @throws \Exception
 	 */
 	private static function pull_or_error( $image, $version ) {
-		if ( ! default_launch( "docker pull $image:$version" ) ) {
+		if ( ! \EE::exec( "docker pull $image:$version" ) ) {
 			throw new \Exception( "Unable to pull $image. Please check logs for more details." );
 		}
 	}
 
 	/**
-	 * Migrates all containers of existing sites
+	 * Get current docker images versions.
+	 *
+	 * @return array
+	 * @throws \Exception
 	 */
-	private static function migrate_site_containers() {
-		$sites       = \EE_DB::select( [ 'site_url', 'site_fs_path', 'site_type', 'cache_nginx_browser', 'site_ssl', 'db_host' ] );
-		$site_docker = new \Site_Docker();
+	private static function get_current_docker_images_versions() {
+		$images = EE::db()
+			->table( 'options' )
+			->where( 'key', 'like', 'easyengine/%' )
+			->all();
 
-		foreach ( $sites as $site ) {
+		$images = array_map( function ( $image ) {
+			return [ $image['key'] => $image['value'] ];
+		}, $images );
 
-			$data   = [];
-			$data[] = $site['site_type'];
-			$data[] = $site['cache_nginx_browser'];
-			$data[] = $site['site_ssl'];
-			$data[] = $site['db_host'];
-
-			$docker_compose_contents    = $site_docker->generate_docker_compose_yml( $data );
-			$docker_compose_path        = $site['site_fs_path'] . '/docker-compose.yml';
-			$docker_compose_backup_path = $site['site_fs_path'] . '/docker-compose.yml.bak';
-
-			self::$rsp->add_step(
-				"upgrade-${site['site_url']}-copy-compose-file",
-				'EE\Migration\Containers::site_copy_compose_file_up',
-				null,
-				[ $site, $docker_compose_path, $docker_compose_backup_path ]
-			);
-
-			self::$rsp->add_step(
-				"upgrade-${site['site_url']}-containers",
-				'EE\Migration\Containers::site_containers_up',
-				'EE\Migration\Containers::site_containers_down',
-				[ $site, $docker_compose_backup_path, $docker_compose_path, $docker_compose_contents ],
-				[ $site, $docker_compose_backup_path, $docker_compose_path ]
-			);
-		}
+		return array_merge( ...$images );
 	}
 
 	/**
 	 * Migrates global containers. These are container which are not created per site (i.e. ee-cron-scheduler)
 	 */
-	private static function migrate_global_containers() {
+	private static function migrate_global_containers( $changed_images ) {
+
+		if ( ! self::is_global_container_image_changed( $changed_images ) ) {
+			return;
+		}
+
+		self::$rsp->add_step(
+			'backup-global-docker-compose-file',
+			'EE\Migration\Containers::backup_global_compose_file',
+			'EE\Migration\Containers::revert_global_containers',
+			null,
+			null
+		);
+
+		self::$rsp->add_step(
+			'stop-global-containers',
+			'EE\Migration\Containers::down_global_containers',
+			null,
+			[ $changed_images ],
+			null
+		);
+
+		self::$rsp->add_step(
+			'generate-global-docker-compose-file',
+			'EE\Service\Utils\generate_global_docker_compose_yml',
+			null,
+			[ new \Symfony\Component\Filesystem\Filesystem() ],
+			null
+		);
 
 		// Upgrade nginx-proxy container
 		$existing_nginx_proxy_image = EE::launch( sprintf( 'docker inspect --format=\'{{.Config.Image}}\' %1$s', EE_PROXY_TYPE ), false, true );
-		if ( 0 === $existing_nginx_proxy_image->return_code ) {
+		if ( in_array( 'easyengine/nginx-proxy', $changed_images, true ) && 0 === $existing_nginx_proxy_image->return_code ) {
 			self::$rsp->add_step(
 				'upgrade-nginxproxy-container',
 				'EE\Migration\Containers::nginxproxy_container_up',
 				'EE\Migration\Containers::nginxproxy_container_down',
 				null,
-				[ $existing_nginx_proxy_image ]
+				null
+			);
+		}
+
+		// Upgrade global-db container
+		$existing_db_image = EE::launch( 'docker inspect --format=\'{{.Config.Image}}\' ' . GLOBAL_DB_CONTAINER, false, true );
+		if ( in_array( 'easyengine/mariadb', $changed_images, true ) && 0 === $existing_db_image->return_code ) {
+			self::$rsp->add_step(
+				'upgrade-global-db-container',
+				'EE\Migration\Containers::global_db_container_up',
+				'EE\Migration\Containers::global_db_container_down',
+				null,
+				null
 			);
 		}
 
 		// Upgrade cron container
-		$existing_cron_image = EE::launch( 'docker inspect --format=\'{{.Config.Image}}\' ee-cron-scheduler', false, true );
-		if ( 0 === $existing_cron_image->return_code ) {
+		$existing_cron_image = EE::launch( 'docker inspect --format=\'{{.Config.Image}}\' ' . EE_CRON_SCHEDULER, false, true );
+		if ( in_array( 'easyengine/cron', $changed_images, true ) && 0 === $existing_cron_image->return_code ) {
 			self::$rsp->add_step(
 				'upgrade-cron-container',
 				'EE\Migration\Containers::cron_container_up',
 				'EE\Migration\Containers::cron_container_down',
 				null,
-				[ $existing_cron_image ]
+				null
 			);
+		}
+
+		// Upgrade redis container
+		$existing_redis_image = EE::launch( 'docker inspect --format=\'{{.Config.Image}}\' ' . GLOBAL_REDIS_CONTAINER, false, true );
+		if ( in_array( 'easyengine/cron', $changed_images, true ) && 0 === $existing_redis_image->return_code ) {
+			self::$rsp->add_step(
+				'upgrade-global-redis-container',
+				'EE\Migration\Containers::global_redis_container_up',
+				'EE\Migration\Containers::global_redis_container_down',
+				null,
+				null
+			);
+		}
+	}
+
+	public static function migrate_site_containers( $changed_images ){
+
+		$db = new \EE_DB();
+		$sites = ($db->table('sites')->all());
+
+		foreach ( $sites as $key => $site ) {
+
+			$docker_yml = $site['site_fs_path'] . '/docker-compose.yml';
+			$docker_yml_backup = $site['site_fs_path'] . '/docker-compose.yml.backup';
+
+			if ( ! SiteContainers::is_site_service_image_changed( $changed_images, $site ) ) {
+				continue;
+			}
+
+			$ee_site_object = SiteContainers::get_site_object( $site['site_type'] );
+
+			if( $site['site_enabled'] ) {
+				self::$rsp->add_step(
+					"disable-${site['site_url']}-containers",
+					'EE\Migration\SiteContainers::disable_site',
+					'EE\Migration\SiteContainers::enable_site',
+					[ $site, $ee_site_object ],
+					[ $site, $ee_site_object ]
+				);
+			}
+
+			self::$rsp->add_step(
+				"take-${site['site_url']}-docker-compose-backup",
+				'EE\Migration\SiteContainers::backup_site_docker_compose_file',
+				'EE\Migration\SiteContainers::revert_site_docker_compose_file',
+				[ $docker_yml, $docker_yml_backup ],
+				[ $docker_yml_backup, $docker_yml ]
+			);
+
+			self::$rsp->add_step(
+				"generate-${site['site_url']}-docker-compose",
+				'EE\Migration\SiteContainers::generate_site_docker_compose_file',
+				null,
+				[ $site ],
+				null
+			);
+
+			if( $site['site_enabled']) {
+				self::$rsp->add_step(
+					"upgrade-${site['site_url']}-containers",
+					'EE\Migration\SiteContainers::enable_site',
+					null,
+					[ $site, $ee_site_object ],
+					null
+				);
+			}
+		}
+	}
+
+	public static function down_global_containers( $changed_images ) {
+
+		chdir( EE_ROOT_DIR . '/services' );
+
+		if ( in_array( 'easyengine/nginx-proxy', $changed_images, true ) ) {
+			if ( ! EE::exec( 'docker-compose stop global-nginx-proxy && docker-compose rm -f global-nginx-proxy' ) ) {
+				throw new \Exception( 'Unable to stop ' . EE_PROXY_TYPE . ' container' );
+			}
+		}
+
+		if ( in_array( 'easyengine/mariadb', $changed_images, true ) ) {
+			if ( ! EE::exec( 'docker-compose stop global-db && docker-compose rm -f global-db' ) ) {
+				throw new \Exception( 'Unable to stop ' . GLOBAL_DB_CONTAINER . 'container' );
+			}
+		}
+
+		if ( in_array( 'easyengine/redis', $changed_images, true ) ) {
+			if ( ! EE::exec( 'docker-compose stop global-redis && docker-compose rm -f global-redis' ) ) {
+				throw new \Exception( 'Unable to stop ' . GLOBAL_REDIS_CONTAINER . 'container' );
+			}
+		}
+
+		if ( in_array( 'easyengine/cron', $changed_images, true ) ) {
+			if ( ! EE::exec( 'docker-compose stop cron-scheduler && docker-compose rm -f cron-scheduler' ) ) {
+				throw new \Exception( 'Unable to stop ' . GLOBAL_REDIS_CONTAINER . 'container' );
+			}
+		}
+
+	}
+
+	/**
+	 * Take backup of current global docker-compose.yml file.
+	 *
+	 * @throws \Exception
+	 */
+	public static function backup_global_compose_file() {
+		$global_compose_file_path = EE_ROOT_DIR . '/services/docker-compose.yml';
+		$global_compose_backup_file_path = EE_ROOT_DIR . '/services/docker-compose.yml.backup';
+
+		if ( ! EE::exec( "cp $global_compose_file_path $global_compose_backup_file_path" ) ) {
+			throw new \Exception( "Unable to find docker-compose.yml or couldn't create it's backup file. Ensure that EasyEngine has permission to create file there" );
+		}
+	}
+
+	/**
+	 * Revert to backed up docker-compose.yml file.
+	 *
+	 * @throws \Exception
+	 */
+	public static function revert_global_containers() {
+		$global_compose_file_path = EE_ROOT_DIR . '/services/docker-compose.yml';
+		$global_compose_backup_file_path = EE_ROOT_DIR . '/services/docker-compose.yml.backup';
+
+		rename( $global_compose_backup_file_path, $global_compose_file_path );
+		chdir( EE_ROOT_DIR . '/services' );
+		$container_downgraded = EE::exec( 'docker-compose up -d' );
+
+		if ( ! $container_downgraded ) {
+			throw new \Exception( 'Unable to downgrade global containers. Please check logs for more details.' );
 		}
 	}
 
@@ -136,14 +320,16 @@ class Containers {
 	 * @throws \Exception
 	 */
 	public static function nginxproxy_container_up() {
-		$EE_ROOT_DIR       = EE_ROOT_DIR;
-		$nginx_proxy_image = 'easyengine/nginx-proxy:v' . EE_VERSION;
-		$ee_proxy_command  = sprintf( 'docker run --name %1$s -e LOCAL_USER_ID=`id -u` -e LOCAL_GROUP_ID=`id -g` --restart=always -d -p 80:80 -p 443:443 -v %2$s/nginx/certs:/etc/nginx/certs -v %2$s/nginx/dhparam:/etc/nginx/dhparam -v %2$s/nginx/conf.d:/etc/nginx/conf.d -v %2$s/nginx/htpasswd:/etc/nginx/htpasswd -v %2$s/nginx/vhost.d:/etc/nginx/vhost.d -v /var/run/docker.sock:/tmp/docker.sock:ro -v %2$s:/app/ee4 -v /usr/share/nginx/html %3$s', EE_PROXY_TYPE, $EE_ROOT_DIR, $nginx_proxy_image );
+		$default_conf_path = EE_ROOT_DIR . '/services/nginx-proxy/conf.d/default.conf';
+		$fs                = new \Symfony\Component\Filesystem\Filesystem();
 
-		default_launch( sprintf( 'docker rm -f %1$s', EE_PROXY_TYPE ), false, true );
+		if ( $fs->exists( $default_conf_path ) ) {
+			$fs->remove( $default_conf_path );
+		}
 
-		if ( ! default_launch( $ee_proxy_command, false, true ) ) {
-			throw new \Exception( sprintf( 'Unable to upgrade %1$s container', EE_PROXY_TYPE ) );
+		chdir( EE_ROOT_DIR . '/services' );
+		if( ! EE::exec( 'docker-compose up -d global-nginx-proxy ' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', EE_PROXY_TYPE ) );
 		}
 
 	}
@@ -156,15 +342,66 @@ class Containers {
 	 * @throws \Exception
 	 */
 	public static function nginxproxy_container_down( $existing_nginx_proxy_image ) {
-		$EE_ROOT_DIR       = EE_ROOT_DIR;
-		$nginx_proxy_image = trim( $existing_nginx_proxy_image->stout );
-		$ee_proxy_command  = sprintf( 'docker run --name %1$s -e LOCAL_USER_ID=`id -u` -e LOCAL_GROUP_ID=`id -g` --restart=always -d -p 80:80 -p 443:443 -v %2$s/nginx/certs:/etc/nginx/certs -v %2$s/nginx/dhparam:/etc/nginx/dhparam -v %2$s/nginx/conf.d:/etc/nginx/conf.d -v %2$s/nginx/htpasswd:/etc/nginx/htpasswd -v %2$s/nginx/vhost.d:/etc/nginx/vhost.d -v /var/run/docker.sock:/tmp/docker.sock:ro -v %2$s:/app/ee4 -v /usr/share/nginx/html %3$s', EE_PROXY_TYPE, $EE_ROOT_DIR, $nginx_proxy_image );
+		chdir( EE_ROOT_DIR . '/services' );
 
-		default_launch( sprintf( 'docker rm -f %1$s', EE_PROXY_TYPE ), false, true );
-
-		if ( ! default_launch( $ee_proxy_command, false, true ) ) {
-			throw new \Exception( sprintf( 'Unable to restore %1$s container', EE_PROXY_TYPE ) );
+		if ( ! EE::exec('docker-compose stop global-nginx-proxy && docker-compose rm -f global-nginx-proxy') ) {
+			throw new \Exception( sprintf( 'Unable to stop %1$s container', EE_PROXY_TYPE ) );
 		}
+
+		$default_conf_path = EE_ROOT_DIR . '/services/nginx-proxy/conf.d/default.conf';
+		$fs                = new \Symfony\Component\Filesystem\Filesystem();
+
+		if ( $fs->exists( $default_conf_path ) ) {
+			$fs->remove( $default_conf_path );
+		}
+	}
+
+	public static function global_db_container_up() {
+		chdir( EE_ROOT_DIR . '/services' );
+
+		if( ! EE::exec( 'docker-compose up -d global-db' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', GLOBAL_DB_CONTAINER ) );
+		}
+	}
+
+	public static function global_db_container_down() {
+		chdir( EE_ROOT_DIR . '/services' );
+
+		if( ! EE::exec( 'docker-compose stop global-db && docker-compose rm -f global-db' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', GLOBAL_DB_CONTAINER ) );
+		}
+	}
+
+	public static function global_redis_container_up() {
+		chdir( EE_ROOT_DIR . '/services' );
+
+		if( ! EE::exec( 'docker-compose up -d global-redis' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', GLOBAL_REDIS_CONTAINER ) );
+		}
+	}
+
+	public static function global_redis_container_down() {
+		chdir( EE_ROOT_DIR . '/services' );
+
+		if( ! EE::exec( 'docker-compose stop global-redis && docker-compose rm -f global-redis' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', GLOBAL_REDIS_CONTAINER ) );
+		}
+	}
+
+	public static function is_global_container_image_changed( $changed_image ) {
+		$global_images = [
+			'easyengine/mariadb',
+			'easyengine/mariadb',
+			'easyengine/redis',
+			'easyengine/cron',
+		];
+
+		$commom_images = array_intersect( $changed_image, $global_images );
+
+		if ( ! empty( $commom_images ) ) {
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -173,13 +410,10 @@ class Containers {
 	 * @throws \Exception
 	 */
 	public static function cron_container_up() {
-		$cron_image                 = 'easyengine/cron:v' . EE_VERSION;
-		$cron_scheduler_run_command = 'docker run --name ee-cron-scheduler --restart=always -d -v ' . EE_ROOT_DIR . '/cron:/etc/ofelia:ro -v /var/run/docker.sock:/var/run/docker.sock:ro ' . $cron_image;
+		chdir( EE_ROOT_DIR . '/services' );
 
-		default_launch( 'docker rm -f ee-cron-scheduler', false, true );
-
-		if ( ! default_launch( $cron_scheduler_run_command, false, true ) ) {
-			throw new \Exception( ' Unable to upgrade ee-cron-scheduler container' );
+		if( ! EE::exec( 'docker-compose up -d docker-compose' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', EE_CRON_SCHEDULER ) );
 		}
 	}
 
@@ -191,65 +425,11 @@ class Containers {
 	 * @throws \Exception
 	 */
 	public static function cron_container_down( $existing_cron_image ) {
-		$cron_image                 = trim( $existing_cron_image->stdout );
-		$cron_scheduler_run_command = 'docker run --name ee-cron-scheduler --restart=always -d -v ' . EE_ROOT_DIR . '/cron:/etc/ofelia:ro -v /var/run/docker.sock:/var/run/docker.sock:ro ' . $cron_image;
+		chdir( EE_ROOT_DIR . '/services' );
 
-		default_launch( 'docker rm -f ee-cron-scheduler', false, true );
-
-		if ( ! default_launch( $cron_scheduler_run_command, false, true ) ) {
-			throw new \Exception( ' Unable to restore ee-cron-scheduler container' );
+		if( ! EE::exec( 'docker-compose stop cron-scheduler && docker-compose rm -f cron-scheduler' ) ) {
+			throw new \Exception( sprintf( 'Unable to restart %1$s container', EE_CRON_SCHEDULER ) );
 		}
 	}
 
-	/**
-	 * Copies updated docker-compose file site root
-	 *
-	 * @param $site Name of site
-	 * @param $docker_compose_path Path where docker-compose.yml is to be copied
-	 * @param $docker_compose_backup_path Path old docker-compose.yml is to be copied for backup
-	 *
-	 * @throws \Exception
-	 */
-	public static function site_copy_compose_file_up( $site, $docker_compose_path, $docker_compose_backup_path ) {
-		if ( ! default_launch( "cp $docker_compose_path $docker_compose_backup_path" ) ) {
-			throw new \Exception( "Unable to find docker-compose.yml in ${site['site_fs_path']} or couldn't create it's backup file. Ensure that EasyEngine has permission to create file there" );
-		}
-	}
-
-	/**
-	 * Upgrades site container of a site
-	 *
-	 * @param $site Name of site
-	 * @param $docker_compose_backup_path Path of old docker-compose.yml file
-	 * @param $docker_compose_path Path of updated docker-compose.yml file
-	 * @param $docker_compose_contents Contents of updated docker-compose.yml file
-	 *
-	 * @throws \Exception
-	 */
-	public static function site_containers_up( $site, $docker_compose_backup_path, $docker_compose_path, $docker_compose_contents ) {
-		file_put_contents( $docker_compose_path, $docker_compose_contents );
-		$container_upgraded = default_launch( "cd ${site['site_fs_path']} && docker-compose up -d" );
-
-		if ( ! $container_upgraded ) {
-			throw new \Exception( "Unable to upgrade containers of site: ${site['site_url']}. Please check logs for more details." );
-		}
-	}
-
-	/**
-	 * Downgrades container of a site.
-	 *
-	 * @param $site Name of site
-	 * @param $docker_compose_backup_path Path of old docker-compose.yml file
-	 * @param $docker_compose_path Path of updated docker-compose.yml file
-	 *
-	 * @throws \Exception
-	 */
-	public static function site_containers_down( $site, $docker_compose_backup_path, $docker_compose_path ) {
-		rename( $docker_compose_backup_path, $docker_compose_path );
-		$container_downgraded = default_launch( "cd ${site['site_fs_path']} && docker-compose up -d" );
-
-		if ( ! $container_downgraded ) {
-			throw new \Exception( "Unable to downgrade containers of ${site['site_url']} site. Please check logs for more details." );
-		}
-	}
 }
