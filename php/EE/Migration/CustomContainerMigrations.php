@@ -5,12 +5,11 @@ namespace EE\Migration;
 use EE;
 use EE\Model\Migration;
 use EE\Utils;
-use Symfony\Component\Finder\Finder;
 
 class CustomContainerMigrations {
 
 	/**
-	 * Executes all pending migrations
+	 * Executes pending migrations of container.
 	 */
 	public static function execute_migrations() {
 
@@ -40,7 +39,7 @@ class CustomContainerMigrations {
 	 * @return array of available migrations
 	 */
 	private static function get_all_migrations() {
-		$migrations = [];
+		$migrations    = [];
 		$packages_path = scandir( EE_VENDOR_DIR . '/easyengine' );
 
 		// get migrations from packages.
@@ -55,8 +54,8 @@ class CustomContainerMigrations {
 					$files = scandir( $migration_path );
 					if ( \EE\Utils\inside_phar() ) {
 						$migrations[] = $files;
-					} else{
-						$migrations[] = array_slice( $files,2);
+					} else {
+						$migrations[] = array_slice( $files, 2 );
 					}
 				}
 			}
@@ -67,8 +66,8 @@ class CustomContainerMigrations {
 			$files = scandir( EE_ROOT . '/migrations/container' );
 			if ( \EE\Utils\inside_phar() ) {
 				$migrations[] = $files;
-			} else{
-				$migrations[] = array_slice( $files,2);
+			} else {
+				$migrations[] = array_slice( $files, 2 );
 			}
 		}
 
@@ -89,6 +88,11 @@ class CustomContainerMigrations {
 	/**
 	 * Executes all migrations passed to it recursively.
 	 * Also undo'es all migration if there was error executing any migration
+	 *
+	 * @param $migrations array of new migrations.
+	 *
+	 * @throws EE\ExitException
+	 * @throws \Throwable
 	 */
 	private static function execute_migration_stack( $migrations ) {
 		if ( empty( $migrations ) ) {
@@ -121,6 +125,7 @@ class CustomContainerMigrations {
 
 			Migration::create( [
 				'migration' => $migrations[0],
+				'type'      => 'container',
 				'timestamp' => date( 'Y-m-d H:i:s' ),
 			] );
 
@@ -146,11 +151,12 @@ class CustomContainerMigrations {
 	}
 
 	/**
-	 *  Get migrations need to be executed.
+	 * Get migrations to be executed.
 	 *
-	 * @param $path path to the migration directory.
+	 * @param $migrations array of all migrations.
 	 *
 	 * @return array
+	 * @throws \Exception
 	 */
 	private static function get_migrations_to_execute( $migrations ) {
 		return array_values(
@@ -164,10 +170,11 @@ class CustomContainerMigrations {
 	/**
 	 * Get already migrated migrations from database.
 	 *
-	 * @return array
+	 * @return array|void
+	 * @throws \Exception
 	 */
 	private static function get_migrations_from_db() {
-		return array_column( Migration::all(), 'migration' );
+		return array_column( Migration::where( 'type', 'container' ), 'migration' );
 	}
 
 	/**
@@ -191,6 +198,13 @@ class CustomContainerMigrations {
 
 	}
 
+	/**
+	 * Get class name from name of migration file.
+	 *
+	 * @param $migration_name string name of migration file.
+	 *
+	 * @return string
+	 */
 	private static function get_migration_class_name( $migration_name ) {
 		// Remove date and package name from it
 		$class_name = preg_replace( '/(^\d*)[_]([a-zA-Z-]*[_])/', '', rtrim( $migration_name, '.php' ) );
@@ -202,6 +216,14 @@ class CustomContainerMigrations {
 		return "\EE\Migration\\$class_name";
 	}
 
+	/**
+	 * Convert string in camelcase format.
+	 *
+	 * @param        $input     string to be camelized.
+	 * @param string $separator string of separator.
+	 *
+	 * @return mixed
+	 */
 	private static function camelize( $input, $separator = '_' ) {
 		return str_replace( $separator, '', ucwords( $input, $separator ) );
 	}

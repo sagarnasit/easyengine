@@ -6,22 +6,70 @@ use EE;
 use Symfony\Component\Filesystem\Filesystem;
 
 /**
- * Migrates existing containers to new image
+ * Migrate site specific containers to new images.
  */
 class SiteContainers {
 
-	public static function backup_site_docker_compose_file( $source_path, $dest_path ) {
-		if ( ! EE::exec( "cp $source_path $dest_path" ) ) {
-			throw new \Exception( "Unable to find site's docker-compose.yml or couldn't create it's backup file. Ensure that EasyEngine has permission to create file there" );
+	/**
+	 * Get object of supported site type.
+	 *
+	 * @param string $site_type type of site.
+	 *
+	 * @return EE\Site\Type\HTML|EE\Site\Type\PHP|EE\Site\Type\WordPress
+	 */
+	public static function get_site_object( $site_type ) {
+		$site_command = new \Site_Command();
+		$site_class   = $site_command::get_site_types()[ $site_type ];
+
+		return new $site_class();
+	}
+
+	/**
+	 * Take backup of site's docker-compose.yml file
+	 *
+	 * @param string $source_path      path of docker-compose.yml.
+	 * @param string $destination_path backup path for docker-compose.yml.
+	 *
+	 * @throws \Exception.
+	 */
+	public static function backup_site_docker_compose_file( $source_path, $destination_path ) {
+		EE::debug( 'Start backing up site\'s docker-compose.yml' );
+		$fs = new Filesystem();
+		if ( ! $fs->exists( $source_path ) ) {
+			throw new \Exception( ' site\'s docker-compose.yml does not exist' );
 		}
+		$fs->copy( $source_path, $destination_path, true );
+		EE::debug( 'Complete backing up site\'s docker-compose.yml' );
 	}
 
-	public static function revert_site_docker_compose_file($source_path, $dest_path ) {
-		rename( $source_path, $dest_path );
-
+	/**
+	 * Revert docker-compose.yml file from backup.
+	 *
+	 * @param string $source_path      path of backed up docker-compose.yml.
+	 * @param string $destination_path original path of docker-compose.yml.
+	 *
+	 * @throws \Exception
+	 */
+	public static function revert_site_docker_compose_file( $source_path, $destination_path ) {
+		EE::debug( 'Start restoring site\'s docker-compose.yml' );
+		$fs = new Filesystem();
+		if ( ! $fs->exists( $source_path ) ) {
+			throw new \Exception( ' site\'s docker-compose.yml.backup does not exist' );
+		}
+		$fs->copy( $source_path, $destination_path, true );
+		$fs->remove( $source_path );
+		EE::debug( 'Complete restoring site\'s docker-compose.yml' );
 	}
 
-	public static function is_site_service_image_changed( $changed_images, $site_info ) {
+	/**
+	 * Check if new image is available for site's services.
+	 *
+	 * @param array $updated_images array of updated images.
+	 * @param array $site_info      array of site info.
+	 *
+	 * @return bool
+	 */
+	public static function is_site_service_image_changed( $updated_images, $site_info ) {
 		chdir( $site_info['site_fs_path'] );
 		$launch   = EE::launch( 'docker-compose config --services' );
 		$services = explode( PHP_EOL, trim( $launch->stdout ) );
@@ -30,93 +78,145 @@ class SiteContainers {
 			return 'easyengine/' . $service;
 		}, $services );
 
-		$common_image = array_intersect( $changed_images, $site_images );
+		$common_image = array_intersect( $updated_images, $site_images );
 
 		if ( ! empty( $common_image ) ) {
 			return true;
 		}
+
 		return false;
 	}
 
-	public static function generate_site_docker_compose_file( $site_info ) {
-
-		$filters = self::get_site_filters( $site_info );
-
-		$site_docker = self::get_site_docker_object( $site_info['site_type'] );
-
-		$docker_yml_content = $site_docker->generate_docker_compose_yml($filters);
-
-		$fs = new Filesystem();
-		$fs->dumpFile( $site_info['site_fs_path'] . '/docker-compose.yml', $docker_yml_content );
-
+	/**
+	 * Generate docker-compose.yml for specific site.
+	 *
+	 * @param array $site_info    array of site information.
+	 * @param object $site_object Object of the particular site-type.
+	 */
+	public static function generate_site_docker_compose_file( $site_info, $site_object ) {
+		$site_object->populate_site_info( $site_info['site_url'] );
+		EE::debug( "Start generating news docker-compose.yml for ${site_info['site_url']}" );
+		$site_object->dump_docker_compose_yml( [ 'nohttps' => ! $site_info['site_ssl'] ] );
+		EE::debug( "Complete generating news docker-compose.yml for ${site_info['site_url']}" );
 	}
 
+	/**
+	 * Enable site.
+	 *
+	 * @param array $site_info    array of site information.
+	 * @param object $site_object object of site-type( HTML, PHP, WordPress ).
+	 *
+	 * @throws \Exception
+	 */
 	public static function enable_site( $site_info, $site_object ) {
-		$site_object->enable( [ $site_info['site_url'] ], [] );
-
+		EE::debug( "Start enabling ${site_info['site_url']}" );
+		try {
+			$site_object->enable( [ $site_info['site_url'] ], [ 'force' => true ], false );
+		} catch ( \Exception $e ) {
+			throw new \Exception( $e->getMessage() );
+		}
+		EE::debug( "Complete enabling ${site_info['site_url']}" );
 	}
 
+	/**
+	 * Disable site.
+	 *
+	 * @param array $site_info    array of site information.
+	 * @param object $site_object object of site-type( HTML, PHP, Wordpress ).
+	 */
 	public static function disable_site( $site_info, $site_object ) {
+		EE::debug( "Start disabling ${site_info['site_url']}" );
 		$site_object->disable( [ $site_info['site_url'] ], [] );
+		EE::debug( "Complete disabling ${site_info['site_url']}" );
 	}
 
-	public static function get_site_object($site_type) {
-		switch($site_type) {
-			case 'html':
-				return new EE\Site\Type\HTML();
+	/**
+	 * Function to delete given volume.
+	 *
+	 * @param string $volume_name  Name of the volume to be deleted.
+	 * @param string $symlink_path Corresponding symlink to be removed.
+	 */
+	public static function delete_volume( $volume_name, $symlink_path ) {
+		$fs = new Filesystem();
+		\EE::exec( 'docker volume rm ' . $volume_name );
+		$fs->remove( $symlink_path );
+	}
 
-			case 'php':
-				return new EE\Site\Type\PHP();
+	/**
+	 * Function to create given volume.
+	 *
+	 * @param string|array $site   Name of the site or array of site having site_url.
+	 * @param string $volume_name  Name of the volume to be created.
+	 * @param string $symlink_path Corresponding symlink to be created.
+	 */
+	public static function create_volume( $site, $volume_name, $symlink_path ) {
+		$site_url = is_array( $site ) ? $site['site_url'] : $site;
+		$volumes  = [
+			[
+				'name'            => $volume_name,
+				'path_to_symlink' => $symlink_path,
+			],
+		];
+		\EE_DOCKER::create_volumes( $site_url, $volumes );
+	}
 
-			case 'wp':
-				return new EE\Site\Type\WordPress();
+	/**
+	 * Function to backup and restore file/directory.
+	 *
+	 * @param string $destination    Destination path.
+	 * @param string $source         Source path.
+	 * @param bool $delete_different Delete files in $destination that are not there in source.
+	 */
+	public static function backup_restore( $source, $destination = '', $delete_different = true ) {
+		$fs          = new Filesystem();
+		$destination = empty( $destination ) ? EE_BACKUP_DIR . '/' . basename( $source ) : $destination;
+		EE::debug( "Copying files from: $source to $destination" );
+		if ( is_file( $source ) ) {
+			$fs->copy( $source, $destination, true );
+		} else {
+			$copy_options = [
+				'override' => true,
+				'delete'   => $delete_different,
+			];
+			$fs->mirror( $source, $destination, null, $copy_options );
 		}
 	}
 
-	public static function get_site_filters($site) {
-		$filters = [];
-
-		switch( $site['site_type']) {
-			case 'html':
-				$filters[] = $site['site_type'];
-				break;
-
-			case 'php':
-				$filters[] = $site['cache_host'];
-				if( 'mysql' === $site['app_sub_type']) {
-					$filters[] = $site['db_host'];
-				}
-
-				break;
-
-			case 'wordpress':
-				$filters[] = $site['app_sub_type'];
-				$filters[] = $site['cache_host'];
-				$filters[] = $site['db_host'];
-
-				break;
-		}
-
-		$filters['nohttps'] = false;
-
-		if( 1 === $site['site_ssl']) {
-			$filters['nohttps'] = true;
-		}
-
-		return $filters;
+	/**
+	 * Function to delete file/directory.
+	 *
+	 * @param string|array $path_to_delete File(s)/Director(y/ies) to be deleted.
+	 */
+	public static function delete( $path_to_delete ) {
+		$fs = new Filesystem();
+		$fs->remove( $path_to_delete );
 	}
 
-	public static function get_site_docker_object( $site_type ){
+	/**
+	 * Function to reload site's nginx.
+	 *
+	 * @param string $site_fs_path   Directory containing site's docker-compose.yml.
+	 */
+	public static function reload_nginx( $site_fs_path ) {
 
-		switch ($site_type) {
-			case 'html':
-				return new EE\Site\Type\Site_HTML_Docker();
+		chdir( $site_fs_path );
+		$success = EE::exec( "docker-compose exec nginx sh -c 'nginx -t && service openresty reload'" );
+		if ( ! $success ) {
+			throw new \Exception( 'Could not reload nginx. Check logs.' );
+		}
+	}
 
-			case 'php':
-				return new EE\Site\Type\Site_PHP_Docker();
+	/**
+	 * Function to pull site docker-compose images.
+	 *
+	 * @param string $site_fs_path   Directory containing site's docker-compose.yml.
+	 */
+	public static function docker_compose_pull( $site_fs_path ) {
 
-			case 'wp':
-				return new EE\Site\Type\Site_WP_Docker();
+		chdir( $site_fs_path );
+		$success = EE::exec( "docker-compose pull" );
+		if ( ! $success ) {
+			throw new \Exception( 'Could pull given images.' );
 		}
 	}
 }

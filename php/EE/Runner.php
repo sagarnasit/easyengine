@@ -54,14 +54,67 @@ class Runner {
 		$this->ensure_present_in_config( 'locale', 'en_US' );
 		$this->ensure_present_in_config( 'ee_installer_version', 'stable' );
 
-		define( 'DB', EE_ROOT_DIR.'/db/ee.sqlite' );
+		define( 'DB', EE_ROOT_DIR . '/db/ee.sqlite' );
 		define( 'LOCALHOST_IP', '127.0.0.1' );
 
 		$db_dir = dirname( DB );
 		if ( ! is_dir( $db_dir ) ) {
 			mkdir( $db_dir );
 		}
-		$this->maybe_trigger_migration();
+
+		$check_requirements = false;
+		if ( ! empty( $this->arguments ) ) {
+			$check_requirements = in_array( $this->arguments[0], [ 'cli', 'config', 'help' ], true ) ? false : true;
+			$check_requirements = ( [ 'site', 'cmd-dump' ] === $this->arguments ) ? false : $check_requirements;
+		}
+
+		if ( $check_requirements ) {
+			$this->check_requirements();
+			$this->maybe_trigger_migration();
+		}
+		if ( [ 'cli', 'info' ] === $this->arguments && $this->check_requirements( false ) ) {
+			$this->maybe_trigger_migration();
+		}
+	}
+
+	/**
+	 * Check EE requirements for required commands.
+	 *
+	 * @param bool $show_error To display error or to retutn status.
+	 */
+	public function check_requirements( $show_error = true ) {
+
+		$docker_running = true;
+		$status         = true;
+		$error          = [];
+
+		$docker_running_cmd = 'docker ps > /dev/null';
+		if ( ! EE::exec( $docker_running_cmd ) ) {
+			$status         = false;
+			$docker_running = false;
+			$error[]        = 'Docker not installed or not running.';
+		}
+
+		$docker_compose_installed = 'command -v docker-compose > /dev/null';
+		if ( ! EE::exec( $docker_compose_installed ) ) {
+			$status  = false;
+			$error[] = 'EasyEngine requires docker-compose.';
+		}
+
+		if ( version_compare( PHP_VERSION, '7.2.0' ) < 0 ) {
+			$status  = false;
+			$error[] = 'EasyEngine requires minimum PHP 7.2.0 to run.';
+		}
+
+		if ( $show_error && ! $status ) {
+			EE::error( reset( $error ), false );
+			if ( IS_DARWIN && ! $docker_running ) {
+				EE::log( 'For macOS docker can be installed using: `brew cask install docker`' );
+			}
+			die;
+		}
+
+		return $status;
 	}
 
 	/**
@@ -69,13 +122,10 @@ class Runner {
 	 */
 	private function migrate() {
 		$rsp = new \EE\RevertableStepProcessor();
-		$rsp->add_step( 'ee-db-migrations', 'EE\Migration\Executor::execute_migrations' );
 
-		$version = Option::where( 'key', 'version' );
-		if ( ! empty( $version ) ) {
-			$rsp->add_step( 'ee-docker-image-migrations', 'EE\Migration\Containers::start_container_migration' );
-			$rsp->add_step( 'ee-custom-container-migrations', 'EE\Migration\CustomContainerMigrations::execute_migrations' );
-		}
+		$rsp->add_step( 'ee-db-migrations', 'EE\Migration\Executor::execute_migrations' );
+		$rsp->add_step( 'ee-custom-container-migrations', 'EE\Migration\CustomContainerMigrations::execute_migrations' );
+		$rsp->add_step( 'ee-docker-image-migrations', 'EE\Migration\Containers::start_container_migration' );
 		return $rsp->execute();
 	}
 
@@ -801,21 +851,33 @@ class Runner {
 	}
 
 	/**
-	 * Triggers migration if current phar version > version in ee_option table
+	 * Triggers migration if current phar version > version in ee_option table.
+	 * Also, trigger migrations if phar version >= version in ee_option table but nightly version differ.
 	 */
 	private function maybe_trigger_migration() {
+
 		$db_version      = Option::get( 'version' );
-		$current_version = preg_replace( '/-nightly.*$/', '', EE_VERSION );
+		$current_version = EE_VERSION;
 
 		if ( ! $db_version ) {
 			$this->trigger_migration( $current_version );
+
 			return;
 		}
 
-		if ( Comparator::lessThan( $current_version, $db_version ) ) {
-			EE::error( 'It seems you\'re not running latest version. Please download and run latest version of EasyEngine' );
-		} elseif ( Comparator::greaterThan( $current_version, $db_version ) ) {
+		$base_db_version      = preg_replace( '/-nightly.*$/', '', $db_version );
+		$base_current_version = preg_replace( '/-nightly.*$/', '', EE_VERSION );
+
+		if ( Comparator::lessThan( $base_current_version, $base_db_version ) ) {
+			if ( ! empty( $this->arguments ) && 'cli' === $this->arguments[0] ) {
+				EE::warning( 'It seems you\'re not running latest version. Update EasyEngine using `ee cli update --stable --yes`.' );
+			} else {
+				EE::error( 'It seems you\'re not running latest version.  Update EasyEngine using `ee cli update --stable --yes`.' );
+			}
+		} elseif ( $db_version !== $current_version ) {
 			EE::log( 'Executing migrations. This might take some time.' );
+			$this->trigger_migration( $current_version );
+		} elseif ( false !== strpos( $current_version, 'nightly' ) ) {
 			$this->trigger_migration( $current_version );
 		}
 	}
@@ -824,7 +886,10 @@ class Runner {
 		if ( ! $this->migrate() ) {
 			EE::error( 'There was some error while migrating. Please check logs.' );
 		}
-		Option::set( 'version', $version );
+		if ( $version !== Option::get( 'version' ) ) {
+			Option::set( 'version', $version );
+			\EE\Service\Utils\set_nginx_proxy_version_conf();
+		}
 	}
 
 	/**

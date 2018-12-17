@@ -94,7 +94,7 @@ class EE {
 
 		if ( ! $cache ) {
 			$home = Utils\get_home_dir();
-			$dir = getenv( 'EE_CACHE_DIR' ) ? : '/opt/easyengine/.cache/';
+			$dir = getenv( 'EE_CACHE_DIR' ) ? : EE_ROOT_DIR . '/.cache/';
 
 			// 6 months, 300mb
 			$cache = new FileCache( $dir, 15552000, 314572800 );
@@ -1186,13 +1186,5 @@ class EE {
 
 	public static function db() {
 		return new EE_DB();
-	}
-
-	public static function docker() {
-		if ( empty( self::$docker ) ) {
-			self::$docker = new EE_DOCKER();
-		}
-
-		return self::$docker;
 	}
 }
